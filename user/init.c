@@ -25,6 +25,18 @@ main(void)
 
   for(;;){
     printf("init: starting sh\n");
+    #ifdef NFUA
+    printf("SELECTION = NFUA\n");
+    #endif
+    #ifdef LAPA
+    printf("SELECTION = LAPA\n");
+    #endif
+    #ifdef SCFIFO
+    printf("SELECTION = SCFIFO\n");
+    #endif
+    #ifdef NONE
+    printf("SELECTION = NONE\n");
+    #endif
     pid = fork();
     if(pid < 0){
       printf("init: fork failed\n");

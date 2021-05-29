@@ -82,6 +82,16 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+enum pagelocation { MEMORY, SWAP, NOTALLOCATED };
+
+//assign 3
+struct data{
+  int offset;                   // offset in swapFile or -1 if not in swapFile 
+  enum pagelocation location; 
+  uint counter;                 // shifted right a page is visited, added for NFUA, LAPA
+  int scfifo_q;                 // indicates the position of the page in the queue (or -1 in not in queue)
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -107,4 +117,8 @@ struct proc {
   char name[16];               // Process name (debugging)
 
   struct file *swapFile;
+  struct data meta_data[MAX_TOTAL_PAGES];
+  char free_offsets[16];      // at most 16 pages should be in swapfile at a given time. 1=free, 0=taken
+  int scfifo_max;             // indicates the position of the last page in the queue
 };
+

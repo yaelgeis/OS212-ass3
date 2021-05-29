@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -14,6 +16,10 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+
+int count_pages(struct proc*);
+void page_in(uint64, pte_t *);
+void page_out(struct proc*, int);
 
 // Make a direct-map page table for the kernel.
 pagetable_t
@@ -80,16 +86,21 @@ kvminithart()
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
-  if(va >= MAXVA)
+  if(va >= MAXVA){
+    // #ifdef NONE
+    // return 0;
+    // #endif
     panic("walk");
+  }
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
-    if(*pte & PTE_V) {
+    if(*pte & PTE_V) { //
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
         return 0;
+      
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
     }
@@ -106,21 +117,26 @@ walkaddr(pagetable_t pagetable, uint64 va)
   pte_t *pte;
   uint64 pa;
 
-  if(va >= MAXVA)
+  if(va >= MAXVA){
     return 0;
+  }
 
   pte = walk(pagetable, va, 0);
-  if(pte == 0)
+  if(pte == 0){
     return 0;
-  if((*pte & PTE_V) == 0)
+  }
+  if((*pte & PTE_V) == 0){
     return 0;
-  if((*pte & PTE_U) == 0)
+  }
+  if((*pte & PTE_U) == 0){
     return 0;
+  }
   pa = PTE2PA(*pte);
   return pa;
+
 }
 
-// add a mapping to the kernel page table.
+// add a mapping to the kernel page" table.
 // only used when booting.
 // does not flush TLB or enable paging.
 void
@@ -156,6 +172,27 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+void update_metadata(uint64 a){
+  // Task1 - update meta_data
+  // No need to update if selection = NONE
+  #ifndef NONE
+    struct proc* p = myproc();
+    int page_idx = a/PGSIZE;
+    p->meta_data[page_idx].offset = -1;
+    p->meta_data[page_idx].location = NOTALLOCATED;
+    #ifdef NFUA
+    p->meta_data[page_idx].counter = 0;
+    #endif
+    #ifdef LAPA
+    p->meta_data[page_idx].counter = 0xFFFFFFFF;
+    #endif
+    #ifdef SCFIFO
+    p->meta_data[page_idx].scfifo_q = -1;
+    #endif
+  #endif
+  
+}
+
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
@@ -169,15 +206,24 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
-    if(PTE_FLAGS(*pte) == PTE_V)
-      panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+    if((pte = walk(pagetable, a, 0)) == 0){
+      // it's possible the space wasn't allocaed yet, continue to next page
+      continue;
+    }
+    if (*pte & PTE_V){
+      if(PTE_FLAGS(*pte) == PTE_V)
+        panic("uvmunmap: not a leaf");
+
+      if(do_free){
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
+        if (myproc()->pagetable == pagetable)
+          update_metadata(a);
+      }
+    }
+    else{
+      if (myproc()->pagetable == pagetable)
+        update_metadata(a);
     }
     *pte = 0;
   }
@@ -212,8 +258,63 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
   memmove(mem, src, sz);
 }
 
+int find_free_offset(struct proc* p){
+  for(int i = 0; i < 16; i++){
+    if (p->free_offsets[i])
+      return i*PGSIZE;
+  }
+  panic("swapfile is full");
+  return -1; // not reached
+}
+
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
+#ifndef NONE
+uint64
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+  char *mem;
+  uint64 a;
+  struct proc *p = myproc();
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    int page_idx = a/PGSIZE;
+    // reached max pages - cannot alloc
+    if(page_idx >= MAX_TOTAL_PAGES)
+      return 0;
+    // if p already has 16 pages in physical memory, map pagetable to swapfile
+    if(count_pages(p) == MAX_PSYC_PAGES){
+      page_out(p, find_free_offset(p));
+    }
+    // has free spots, map pageteable into physical memory
+    mem = kalloc();
+    if(mem == 0){
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    memset(mem, 0, PGSIZE);
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+      kfree(mem);
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    p->meta_data[page_idx].offset = -1;
+    p->meta_data[page_idx].location = MEMORY;
+    
+    #ifdef SCFIFO
+      p->meta_data[page_idx].scfifo_q = p->scfifo_max+1;
+      p->scfifo_max++;
+    #endif
+  }  
+  return newsz;
+}
+#endif
+
+#ifdef NONE
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
@@ -239,6 +340,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   }
   return newsz;
 }
+#endif
 
 // Deallocate user pages to bring the process size from oldsz to
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
@@ -303,18 +405,29 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+    
+    // it's possible the space wasn't allocaed yet, continue to next page
+    // if(((pte = walk(old, i, 0)) == 0) || ((*pte & PTE_V) == 0) )
+    if( (pte = walk(old, i, 0)) == 0)
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    if((*pte & PTE_V) != 0 ){
+      if((mem = kalloc()) == 0)
+        goto err;
+      memmove(mem, (char*)pa, PGSIZE);
+      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+        kfree(mem);
+        goto err;
+      }
+    }
+    else if((*pte & PTE_PG) != 0){
+      pte_t *new_pte;
+      if ((new_pte =  walk(new, i, flags)) == 0)
+        goto err;
+      *new_pte |= flags;
     }
   }
   return 0;
@@ -428,4 +541,230 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+uint count_one_bits(int n){
+  uint count = 0;
+  while (n > 0) {
+    count += n & 1;
+    n >>= 1;
+  }
+  return count;
+}
+
+int nfua_algo(struct proc* p){
+  int min_idx = 0;
+  uint min_counter = __UINT32_MAX__;
+  for(int i = 3; i < MAX_TOTAL_PAGES; i++){
+    if(p->meta_data[i].location == MEMORY && (uint)p->meta_data[i].counter < min_counter){
+      min_counter = p->meta_data[i].counter;
+      min_idx = i;
+    }
+  }
+  return min_idx;
+}
+
+int lapa_algo(struct proc* p){
+  int min_idx = 0;
+  uint min_bits = __UINT32_MAX__;
+  for(int i = 3; i < MAX_TOTAL_PAGES; i++){
+    if(p->meta_data[i].location == MEMORY){
+      uint bits = count_one_bits(p->meta_data[i].counter);
+      if ((bits < min_bits) ||
+          (bits == min_bits && p->meta_data[i].counter < p->meta_data[min_idx].counter)){
+        min_bits = bits;
+        min_idx = i;
+      }
+    }
+  }
+  return min_idx;
+}
+
+int scfifo_algo(struct proc* p){
+  for(;;){
+    int min_idx = 0;
+    int min_q = __INT32_MAX__;
+    for(int i = 3; i < MAX_TOTAL_PAGES; i++){
+      if(p->meta_data[i].location == MEMORY){
+        if(p->meta_data[i].scfifo_q < min_q){
+          min_idx = i;
+          min_q = p->meta_data[i].scfifo_q;
+        }                     
+      }
+    }
+    pte_t * pte = walk(p->pagetable, min_idx*PGSIZE ,0);
+    // found the first pte in queue and it has not been accessed 
+    if (!(*pte & PTE_A)) 
+      return min_idx;
+
+    // found the first pte in queue but it has been accessed
+    // turn of pte_a flag and move the page the end of the queue
+    *pte = *pte & ~PTE_A;
+    p->meta_data[min_idx].scfifo_q = p->scfifo_max;
+    p->scfifo_max++;
+  }
+  return 0; //not reached  
+}
+
+int paging_algorithm(struct proc* p){
+  #ifdef NFUA
+  return nfua_algo(p);
+  #endif
+
+  #ifdef LAPA
+  return lapa_algo(p);
+  #endif
+  
+  #ifdef SCFIFO
+  return scfifo_algo(p);
+  #endif
+
+  return 0; //not reached
+}
+
+int count_pages(struct proc* p){
+  int counter = 0;
+  for(int i = 0; i < MAX_TOTAL_PAGES; i++){
+    if (p->meta_data[i].location == MEMORY)
+      counter++;
+  }
+  return counter; 
+}
+
+// finds a page to remove and write it in swapfile in the given offset
+void page_out(struct proc* p, int offset){
+  int idx = paging_algorithm(p);       // find page to swap out bt paging algorithm
+  printf("process %d, paging out %d\n", p->pid, idx );
+  uint64 va = idx*PGSIZE;
+  pte_t *pte =  walk(p->pagetable, va, 0); // returns the pte found at va
+
+  if (pte == 0){
+    panic("pageout");
+  }
+  if (*pte == 0){ //no need to copy
+    p->meta_data[idx].offset = offset;
+    p->meta_data[idx].location = SWAP;
+    *pte = *pte & PTE_PG;
+    return;
+  }
+
+  // get the physical address of pte and write its content to swapfile
+  uint64 pa = walkaddr(p->pagetable, va);
+  // uint64 pa = PTE2PA(*pte);
+  if(writeToSwapFile(p,(char*)pa,offset,PGSIZE) ==  -1)
+    panic("write to swap");
+
+  p->free_offsets[offset/PGSIZE] = 0;
+
+  // free the physical memory of the page
+  kfree((void*)pa);
+
+  // turn pte_v off and turn pte_pg on
+  *pte = (*pte & (~PTE_V)) | PTE_PG;
+
+  p->meta_data[idx].offset = offset;
+  p->meta_data[idx].location = SWAP;
+}
+
+// finds the page located at addr in the swapfile and read it into memory
+void page_in(uint64 addr, pte_t * pte){
+  struct proc* p = myproc();
+  // round addres and get page index
+  int page_idx = PGROUNDDOWN(addr)/PGSIZE;
+  printf("process %d, paging in %d\n", p->pid, page_idx );
+
+
+  if (p->meta_data[page_idx].location != SWAP)
+    panic("page not in swapfile");
+  
+
+  // this offset will be cleaned, we can send it to page out if needed
+  int offset = p->meta_data[page_idx].offset;
+  p->free_offsets[offset/PGSIZE] = 0;
+  
+  char *buf, *mem;
+
+  
+  if(((buf = kalloc()) == 0) || ((mem = kalloc()) == 0))
+    panic("page in: out of memory");
+  
+  mappages(p->pagetable, PGROUNDDOWN(addr), PGSIZE, (uint64)mem, 
+    PTE_W | PTE_R | PTE_X | PTE_U);
+  
+  if (readFromSwapFile(p, buf ,offset, PGSIZE) == -1)
+    panic("read swapfile");
+
+  p->free_offsets[offset/PGSIZE] = 0;
+
+  // if there are 16 pages in physical memory, move one page into swap file
+  if(count_pages(p) == MAX_PSYC_PAGES){
+    page_out(p, offset);
+    *pte = PA2PTE((uint64)buf) | ((PTE_FLAGS(*pte)& ~PTE_PG) | PTE_V);
+  }  
+  else{
+    *pte = PA2PTE((uint64)buf) | PTE_V;
+  }
+    
+  sfence_vma(); //refresh TLB
+
+  //update meta_data
+  p->meta_data[page_idx].offset = -1;
+  p->meta_data[page_idx].location = MEMORY;
+
+}
+
+void determine_pagefault(){
+  struct proc *p = myproc();
+  uint64 addr = r_stval();  // find the faulting address
+  
+  #ifndef NONE
+  pte_t * pte = walk(p->pagetable, PGROUNDDOWN(addr), 0);
+  // paged out
+  if(addr <= p->sz && pte != 0 && *pte != 0 && (*pte & PTE_PG) &&  (*pte & ~PTE_V))
+    page_in(addr, pte);
+
+  else if (addr <= p->sz){
+    printf("process %d allocating page %d, *lazy*\n", p->pid,PGROUNDDOWN(addr)/PGSIZE );
+    if (uvmalloc(myproc()->pagetable,PGROUNDDOWN(addr), PGROUNDDOWN(addr) + PGSIZE) == 0)
+      panic("could not allocate page");
+  }
+  #endif
+  
+  #ifdef NONE
+  // valid page not yet allocated
+  if (addr <= p->sz){
+    if (uvmalloc(myproc()->pagetable,PGROUNDDOWN(addr), PGROUNDDOWN(addr) + PGSIZE) == 0)
+      panic("could not allocate page");
+  }
+  #endif
+
+  // segmentation fault
+  else{
+    printf("segmentaion fault: pid = %d, stval=%p\n", p->pid, addr);
+    p->killed = 1;
+  }
+}
+
+void update_counter(){
+  struct proc* p = myproc();
+  for (int i = 0 ; i < MAX_TOTAL_PAGES; i++){
+    if (p->meta_data[i].location == MEMORY){
+      pte_t * pte = walk(p->pagetable, i*PGSIZE ,0);
+      p->meta_data[i].counter = (p->meta_data[i].counter) >> 1;
+      if (*pte & PTE_A){                           // check if the page was referanced
+        p->meta_data[i].counter = (p->meta_data[i].counter) | (1L << 31);    // add 1 to MSB 
+        *pte = *pte & (~PTE_A);                    // turn accessed bit off
+      }
+    }
+  }
+}
+
+void update_pages_counter(){
+  #ifdef NFUA
+    update_counter();
+  #endif 
+  #ifdef LAPA
+    update_counter();
+  #endif
+  return;
 }

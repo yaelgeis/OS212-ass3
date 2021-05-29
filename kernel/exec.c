@@ -21,6 +21,15 @@ exec(char *path, char **argv)
   pagetable_t pagetable = 0, oldpagetable;
   struct proc *p = myproc();
 
+  //backup meta data
+  struct data data_backup[MAX_TOTAL_PAGES];
+  for (int i = 0; i < MAX_TOTAL_PAGES; i++){
+    data_backup[i].counter = p->meta_data[i].counter;
+    data_backup[i].location = p->meta_data[i].location;
+    data_backup[i].offset = p->meta_data[i].offset;
+    data_backup[i].scfifo_q = p->meta_data[i].scfifo_q;
+  }
+
   begin_op();
 
   if((ip = namei(path)) == 0){
@@ -107,6 +116,15 @@ exec(char *path, char **argv)
     if(*s == '/')
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
+
+  #ifndef NONE
+  if (p->pid > 2){
+    if (removeSwapFile(p) != 0)
+      goto bad;
+    if (createSwapFile(p) != 0)
+      goto bad;
+  }
+  #endif
     
   // Commit to the user image.
   oldpagetable = p->pagetable;
@@ -114,19 +132,32 @@ exec(char *path, char **argv)
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
 
+  
+  proc_freepagetable(oldpagetable, oldsz);
+ 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:
+ //printf("bad!!, pid = %d\n", p->pid);
   if(pagetable)
     proc_freepagetable(pagetable, sz);
   if(ip){
     iunlockput(ip);
     end_op();
   }
+
+  //restore meta_data
+  for (int i = 0; i < MAX_TOTAL_PAGES; i++){
+    p->meta_data[i].counter = data_backup[i].counter;
+    p->meta_data[i].location = data_backup[i].location;
+    p->meta_data[i].offset = data_backup[i].offset;
+    p->meta_data[i].scfifo_q = data_backup[i].scfifo_q;
+  }
+
   return -1;
 }
+
 
 // Load a program segment into pagetable at virtual address va.
 // va must be page-aligned

@@ -95,3 +95,9 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_print_metadata(void){
+  print_metadata();
+  return 0;
+}

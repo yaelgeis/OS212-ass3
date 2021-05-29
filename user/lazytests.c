@@ -14,7 +14,6 @@ void
 sparse_memory(char *s)
 {
   char *i, *prev_end, *new_end;
-  
   prev_end = sbrk(REGION_SZ);
   if (prev_end == (char*)0xffffffffffffffffL) {
     printf("sbrk() failed\n");
@@ -125,6 +124,7 @@ main(int argc, char *argv[])
   if(argc > 1) {
     n = argv[1];
   }
+
   
   struct test {
     void (*f)(char *);

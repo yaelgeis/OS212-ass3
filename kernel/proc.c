@@ -140,6 +140,20 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  
+  for(int i = 3; i < MAX_TOTAL_PAGES; i++){
+    p->meta_data[i].counter = 0;
+    #ifdef LAPA
+      p->meta_data[i].counter = 0xFFFFFFFF;
+    #endif
+    p->meta_data[i].offset = -1;
+    p->meta_data[i].location = NOTALLOCATED;
+    p->meta_data[i].scfifo_q = -1;
+  }
+  p->scfifo_max = -1;
+  for(int i = 0; i < 16; i++){
+    p->free_offsets[i] = 1;
+  }
 
   return p;
 }
@@ -149,13 +163,23 @@ found:
 // p->lock must be held.
 static void
 freeproc(struct proc *p)
-{
+{ 
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
+  if(p->pagetable){
     proc_freepagetable(p->pagetable, p->sz);
+  }
   p->pagetable = 0;
+  for(int i = 3; i < MAX_TOTAL_PAGES; i++){
+    p->meta_data[i].counter = 0;
+     #ifdef LAPA
+      p->meta_data[i].counter = 0xFFFFFFFF;
+    #endif
+    p->meta_data[i].offset = -1;
+    p->meta_data[i].scfifo_q = -1;
+    p->meta_data[i].location = NOTALLOCATED;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -256,15 +280,29 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
-  if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
-      return -1;
-    }
-  } else if(n < 0){
+  if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
-  p->sz = sz;
+  p->sz = p->sz + n;
   return 0;
+}
+
+// Task1
+void 
+copySwap(struct proc* dst, struct proc *src){
+  char* buffer = kalloc();
+  if(buffer == 0)
+    panic("kalloc failed");
+  for(int i = 0; i < MAX_TOTAL_PAGES; i++) {
+    // if the page is written in the swap file
+    if(src->meta_data[i].location == SWAP) {
+      int offset = src->meta_data[i].offset;
+      readFromSwapFile(src, buffer, offset, PGSIZE);
+      writeToSwapFile(dst, buffer, offset, PGSIZE);
+      memset((void*)buffer, 0, PGSIZE);
+    }
+  }
+  kfree(buffer);
 }
 
 // Create a new process, copying the parent.
@@ -280,7 +318,7 @@ fork(void)
   if((np = allocproc()) == 0){
     return -1;
   }
-
+  
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
@@ -306,6 +344,26 @@ fork(void)
   pid = np->pid;
 
   release(&np->lock);
+
+  #ifndef NONE
+    // 0 = initproc, 1 = shell
+    if(pid > 2 && createSwapFile(np) != 0) 
+      panic("create swap file failed");
+    //copy parent's swap file 
+    if(p->pid > 2) 
+      copySwap(np, p);
+  #endif
+
+  for(int i=0; i<MAX_TOTAL_PAGES; i++){
+    np->meta_data[i].counter =  p->meta_data[i].counter;
+    np->meta_data[i].offset = p->meta_data[i].offset;
+    np->meta_data[i].location = p->meta_data[i].location;
+  }
+
+  for(int i = 0; i < 16; i++){
+    np->free_offsets[i] = p->free_offsets[i];
+  }
+
 
   acquire(&wait_lock);
   np->parent = p;
@@ -352,6 +410,11 @@ exit(int status)
       p->ofile[fd] = 0;
     }
   }
+  #ifndef NONE
+    if(p->pid > 2){ // 1-initproc, 2-shell
+      removeSwapFile(p);
+    }
+  #endif
 
   begin_op();
   iput(p->cwd);
@@ -454,7 +517,6 @@ scheduler(void)
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
-
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -485,8 +547,11 @@ sched(void)
     panic("sched running");
   if(intr_get())
     panic("sched interruptible");
-
   intena = mycpu()->intena;
+  
+  //Ass3
+  update_pages_counter();
+  
   swtch(&p->context, &mycpu()->context);
   mycpu()->intena = intena;
 }
@@ -653,4 +718,32 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+
+void print_metadata(){
+  struct proc* p = myproc();
+  int swap_counter = 0;
+  int memory_counter = 0;
+  printf("\n----printing metedata for pid %d----\n\n", p->pid);
+  for (int i = 0; i < MAX_TOTAL_PAGES; i++){
+    char* location = "NOTALLOCATED";
+    if (p->meta_data[i].location == SWAP){
+      location = "SWAP";
+      swap_counter++;
+    }
+    else if (p->meta_data[i].location == MEMORY){
+      location = "MEMORY";
+      memory_counter++;
+    }
+    #ifdef NONE
+      printf("idx = %d, location = %s\n", i, location);
+    #elif SCFIFO
+      printf("idx = %d, location = %s, queue = %d\n", i, location, p->meta_data[i].scfifo_q);
+    #else
+      printf("idx = %d, location = %s, counter = %d\n", i, location, p->meta_data[i].counter);
+    #endif
+  }
+  printf("\ntotal of %d pages in memory, %d pages in swap file\n\n", memory_counter,swap_counter);
+
 }

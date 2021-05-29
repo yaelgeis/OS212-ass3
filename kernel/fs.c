@@ -290,7 +290,6 @@ ilock(struct inode *ip)
 {
   struct buf *bp;
   struct dinode *dip;
-
   if(ip == 0 || ip->ref < 1)
     panic("ilock");
 
@@ -340,7 +339,6 @@ iput(struct inode *ip)
     // ip->ref == 1 means no other process can have ip locked,
     // so this acquiresleep() won't block (or deadlock).
     acquiresleep(&ip->lock);
-
     release(&itable.lock);
 
     itrunc(ip);
@@ -769,7 +767,6 @@ removeSwapFile(struct proc* p)
 int
 createSwapFile(struct proc* p)
 {
-
   char path[DIGITS];
   memmove(path,"/.swap", 6);
   itoa(p->pid, path+ 6);
@@ -781,15 +778,13 @@ createSwapFile(struct proc* p)
   p->swapFile = filealloc();
   if (p->swapFile == 0)
     panic("no slot for files on /store");
-
   p->swapFile->ip = in;
   p->swapFile->type = FD_INODE;
   p->swapFile->off = 0;
   p->swapFile->readable = O_WRONLY;
   p->swapFile->writable = O_RDWR;
-    end_op();
-
-    return 0;
+  end_op();
+  return 0;
 }
 
 //return as sys_write (-1 when error)
